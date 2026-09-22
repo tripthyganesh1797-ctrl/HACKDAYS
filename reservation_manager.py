@@ -1,3 +1,4 @@
+
 """
 reservation_manager.py
 -----------------------
@@ -10,11 +11,8 @@ WHAT IT DOES:
 3. Uses a Markov Transition Matrix to calculate the probability of the NEXT
    tool dependency and issues soft pre-reservations ONLY when spare capacity exists
    (prevents OVER-ALLOCATION).
-4. REAL DEMAND ALWAYS BEATS A PREDICTION: if a resource looks full only because
-   of soft (predicted) reservations, and a real request arrives, the weakest
-   prediction is evicted to make room. A guess must never block real, present
-   work - otherwise predictions could accidentally cause the exact starvation
-   the controller is supposed to prevent.
+4. REAL DEMAND ALWAYS BEATS A PREDICTION: evicts the weakest prediction to make room.
+5. Captures and exports execution timeline slices for Plotly Gantt rendering.
 """
 
 import random
@@ -95,8 +93,7 @@ class ReservationManager:
                 self.log.append((tick, f"{agent_id} reserved {resource}"))
             return True
 
-        # No free capacity. If this is REAL demand, a mere guess should never
-        # block it - try evicting the weakest prediction first.
+        # No free capacity. If this is REAL demand, evict weakest prediction first
         if not predicted:
             if self._evict_weakest_prediction(tick, resource, evicted_by=agent_id):
                 self.holders[resource][agent_id] = duration
@@ -110,6 +107,8 @@ class ReservationManager:
     def tick_update(self, tick):
         """Decrements timers, releases completed holds, and advances FIFO queue."""
         finished_steps = []
+        newly_granted = []
+
         for resource, holders in self.holders.items():
             done_agents = [a for a, remaining in holders.items() if remaining <= 1]
 
@@ -126,8 +125,9 @@ class ReservationManager:
                     nxt = self.queue[resource].popleft()
                     self.holders[resource][nxt] = DEFAULT_DURATION
                     self.log.append((tick, f"{nxt} granted {resource} from queue"))
+                    newly_granted.append((nxt, resource, DEFAULT_DURATION))
 
-        return finished_steps
+        return finished_steps, newly_granted
 
     def snapshot(self):
         """Returns a snapshot of current system utilization."""
@@ -162,11 +162,13 @@ def make_agents(resource_names, num_agents=6, max_ticks=40, seed=42):
 
 
 def run_simulation(resources: dict, num_agents=6, ticks=40, seed=42):
-    """Runs the full simulation ticks and builds state history."""
+    """Runs the full simulation ticks and builds state history along with Gantt records."""
     mgr = ReservationManager(resources)
     agents = make_agents(list(resources.keys()), num_agents, ticks, seed)
 
     history = []
+    gantt_records = []
+
     for t in range(ticks):
         tick_start_log_len = len(mgr.log)
 
@@ -178,9 +180,18 @@ def run_simulation(resources: dict, num_agents=6, ticks=40, seed=42):
             curr_resource = ag["seq"][ag["idx"]]
             curr_duration = ag["durations"][ag["idx"]]
 
-            # Request current step (REAL demand - can preempt weak predictions)
+            # Request current step
             if ag["id"] not in mgr.holders[curr_resource] and ag["id"] not in mgr.queue[curr_resource]:
-                mgr.try_reserve(t, ag["id"], curr_resource, curr_duration)
+                granted = mgr.try_reserve(t, ag["id"], curr_resource, curr_duration)
+                if granted:
+                    gantt_records.append({
+                        "Agent": ag["id"],
+                        "Resource": curr_resource,
+                        "Start": t,
+                        "Finish": t + curr_duration,
+                        "Duration": curr_duration,
+                        "Step": f"Step {ag['idx'] + 1} ({curr_resource})"
+                    })
 
             # Look ahead and pre-reserve using transition matrix probability
             nxt_idx = ag["idx"] + 1
@@ -188,13 +199,25 @@ def run_simulation(resources: dict, num_agents=6, ticks=40, seed=42):
                 nxt_resource = ag["seq"][nxt_idx]
                 nxt_duration = ag["durations"][nxt_idx]
 
-                # Calculate probability from matrix
                 prob = SERVICE_TRANSITIONS.get(curr_resource, {}).get(nxt_resource, 0.4)
                 if prob >= 0.3:  # Confidence threshold filter
                     mgr.try_reserve(t, ag["id"], nxt_resource, nxt_duration, predicted=True, probability=prob)
 
         # 2. Advance timers & process queue
-        finished = mgr.tick_update(t)
+        finished, newly_granted = mgr.tick_update(t)
+
+        # Record tasks dispatched directly from queue into the Gantt timeline
+        for nxt_agent, resource, duration in newly_granted:
+            ag_obj = next((a for a in agents if a["id"] == nxt_agent), None)
+            step_label = f"Step {ag_obj['idx'] + 1} ({resource})" if ag_obj else f"Dispatched ({resource})"
+            gantt_records.append({
+                "Agent": nxt_agent,
+                "Resource": resource,
+                "Start": t,
+                "Finish": t + duration,
+                "Duration": duration,
+                "Step": step_label
+            })
 
         # 3. Advance completed agents to their next step
         for agent_id, resource in finished:
@@ -209,10 +232,11 @@ def run_simulation(resources: dict, num_agents=6, ticks=40, seed=42):
             "log": mgr.log[tick_start_log_len:],
         })
 
-    return history, agents
+    return history, agents, gantt_records
 
 
 if __name__ == "__main__":
     RESOURCES = {"GPU": 2, "API": 3, "DB": 5, "IMAGE_MODEL": 1}
-    history, agents = run_simulation(RESOURCES, num_agents=6, ticks=40)
+    history, agents, gantt = run_simulation(RESOURCES, num_agents=6, ticks=40)
     print("Simulation completed successfully. Total ticks:", len(history))
+    print("Gantt execution slices captured:", len(gantt))
